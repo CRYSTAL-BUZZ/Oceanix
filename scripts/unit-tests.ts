@@ -1,0 +1,808 @@
+/**
+ * Fast, deterministic, fully-offline unit tests for the core math and rules.
+ *
+ * These run *before* the integration sweep on `npm test` and cover the pieces
+ * the sweep only exercises indirectly: geodesy edges, advisory expiry/headline
+ * rules, and localization integrity across all 11 languages. No network, no
+ * server, no keys — pure imports from `src/core`.
+ *
+ *   npm run test:unit    → this file
+ *   npm test             → this file, then scripts/test-sweep.ts
+ */
+
+import {
+  COMPASS_POINTS_16,
+  EARTH_RADIUS_KM,
+  destinationPoint,
+  formatBearing,
+  haversineKm,
+  initialBearingDeg,
+  kmToNauticalMiles,
+  nauticalMilesToKm,
+  pointInPolygon,
+  roundTo,
+} from '../src/core/geo';
+import {
+  HEADLINE_HORIZON_KM,
+  bulletinStillValid,
+  parseBulletinExpiry,
+  pickHeadlineAlert,
+} from '../src/core/alerts';
+import { DATA_CYCLE, GEOFENCES, TIDE_STATIONS } from '../src/core/dataset';
+import { getHistoricalSeries } from '../src/core/dataAccess';
+import { buildRecommendations, diagnose } from '../src/agents/historicalAgent';
+import { getPhrasebook, SUPPORTED_PHRASEBOOK_LANGUAGES, riskWord } from '../src/core/i18n';
+import { localizeCondition, localizeSource } from '../src/core/localize';
+import {
+  buildOcean,
+  fetchPointOceanBatch,
+  peekLive,
+  refreshLive,
+  upstreamFailures,
+} from '../src/core/live';
+import type { MarineAlert } from '../src/types';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+let passed = 0;
+let failed = 0;
+const failures: string[] = [];
+
+function check(label: string, ok: boolean, detail = ''): void {
+  if (ok) {
+    passed += 1;
+  } else {
+    failed += 1;
+    failures.push(`${label}${detail ? ` — ${detail}` : ''}`);
+  }
+}
+
+function approx(a: number, b: number, tolerance: number): boolean {
+  return Math.abs(a - b) <= tolerance;
+}
+
+/* ------------------------------------------------------------------ *
+ * Section 1 — geodesy
+ * ------------------------------------------------------------------ */
+
+{
+  // A quarter of the Earth's circumference along the equator: (0,0)→(0,90).
+  const quarter = haversineKm({ latitude: 0, longitude: 0 }, { latitude: 0, longitude: 90 });
+  check('geo · quarter circumference', approx(quarter, (Math.PI / 2) * EARTH_RADIUS_KM, 1), String(quarter));
+
+  check('geo · distance symmetric', approx(
+    haversineKm({ latitude: 12.97, longitude: 77.59 }, { latitude: 19.076, longitude: 72.877 }),
+    haversineKm({ latitude: 19.076, longitude: 72.877 }, { latitude: 12.97, longitude: 77.59 }),
+    1e-6,
+  ));
+
+  check('geo · zero distance', haversineKm({ latitude: 8.9, longitude: 76.3 }, { latitude: 8.9, longitude: 76.3 }) === 0);
+
+  check('geo · due north bearing 0', approx(initialBearingDeg({ latitude: 0, longitude: 0 }, { latitude: 10, longitude: 0 }), 0, 0.5));
+  check('geo · due east bearing 90', approx(initialBearingDeg({ latitude: 0, longitude: 0 }, { latitude: 0, longitude: 10 }), 90, 0.5));
+
+  // Destination round-trip: travel 120 km at 33°, you should be ~120 km back.
+  const origin = { latitude: 12.97, longitude: 77.59 };
+  const dest = destinationPoint(origin, 33, 120);
+  const back = haversineKm(origin, dest);
+  check('geo · destination round-trip', approx(back, 120, 0.5), String(back));
+
+  check('geo · formatBearing N/E/SE', formatBearing(0) === 'N (0°)' && formatBearing(90) === 'E (90°)' && /^SE \(\d+°\)$/.test(formatBearing(135)), formatBearing(135));
+  check('geo · 16 compass points', COMPASS_POINTS_16.length === 16);
+
+  // Point-in-polygon: a small triangle around (12.97, 77.59).
+  const triangle = [
+    { latitude: 12.5, longitude: 77.0 },
+    { latitude: 13.5, longitude: 77.0 },
+    { latitude: 13.0, longitude: 78.2 },
+  ];
+  check('geo · point inside polygon', pointInPolygon({ latitude: 12.97, longitude: 77.6 }, triangle) === true);
+  check('geo · point outside polygon', pointInPolygon({ latitude: 1.0, longitude: 1.0 }, triangle) === false);
+
+  check('geo · roundTo', roundTo(1.234, 2) === 1.23 && roundTo(1.235, 2) === 1.24);
+  check('geo · nm conversion', approx(kmToNauticalMiles(1), 0.53996, 1e-3) && approx(nauticalMilesToKm(1), 1.852, 1e-3));
+}
+
+/* ------------------------------------------------------------------ *
+ * Section 2 — advisory expiry & headline rules
+ * ------------------------------------------------------------------ */
+
+{
+  const now = Date.now();
+
+  const iso = parseBulletinExpiry(new Date(now + 3600e3).toISOString());
+  check('expiry · ISO absolute', iso !== null && approx(iso - now, 3600e3, 2000), String(iso));
+
+  const relIso = parseBulletinExpiry(`+3 h from ${new Date(now).toISOString()}`);
+  check('expiry · relative + ISO', relIso !== null && approx(relIso - now, 3 * 3600e3, 2000), String(relIso));
+
+  const ist = parseBulletinExpiry('+22 h from 09 Sep 2026, 08:30 IST');
+  // 08:30 IST = 03:00Z; +22 h → 2026-09-10T01:00:00Z.
+  check('expiry · relative + IST stamp', ist !== null && ist === Date.UTC(2026, 8, 10, 1, 0, 0), String(ist));
+
+  check('expiry · unknown shape → conservative null', parseBulletinExpiry('tomorrow-ish') === null);
+
+  check('expiry · seed stamps lapse', parseBulletinExpiry('+12 h from 09 Sep 2026, 08:30 IST') !== null);
+
+  const validAlert = (over: Partial<MarineAlert>): MarineAlert =>
+    ({
+      id: 't',
+      title: 't',
+      type: 'cyclone',
+      advisoryLevel: 'YELLOW',
+      severity: 'moderate',
+      distanceKm: 40,
+      bearing: 'N',
+      withinInfluence: true,
+      validUntil: '+2 h from 09 Sep 2026, 08:30 IST',
+      action: '',
+      source: 'test',
+      ...over,
+    }) as MarineAlert;
+
+  const lapsed = validAlert({ validUntil: '+1 h from 09 Sep 2026, 08:30 IST', withinInfluence: true });
+  check('expiry · lapsed bulletin stops governing', bulletinStillValid(lapsed, new Date('2026-09-09T12:00:00Z')) === false);
+
+  const future = validAlert({ validUntil: '+48 h from 09 Sep 2026, 08:30 IST', withinInfluence: true });
+  check('expiry · live bulletin governs', bulletinStillValid(future, new Date('2026-09-09T12:00:00Z')) === true);
+
+  check('expiry · outside influence never in force', bulletinStillValid(validAlert({ withinInfluence: false })) === false);
+
+  const mk = (id: string, distanceKm: number, withinInfluence: boolean, advisoryLevel: MarineAlert['advisoryLevel']): MarineAlert =>
+    validAlert({ id, distanceKm, withinInfluence, advisoryLevel });
+
+  check('headline · far-only event NOT headlined', pickHeadlineAlert([mk('far', 980, false, 'RED')]) === null);
+  check('headline · nearest inside horizon when nothing in force', pickHeadlineAlert([mk('far', 900, false, 'RED'), mk('near', 120, false, 'GREEN')])?.id === 'near');
+  check('headline · advisory in force beats nearer badge', pickHeadlineAlert([mk('far', 900, false, 'RED'), mk('local', 45, true, 'YELLOW')])?.id === 'local');
+  check('headline · severity wins among in-force', pickHeadlineAlert([mk('a', 40, true, 'YELLOW'), mk('b', 80, true, 'RED')])?.id === 'b');
+  check('headline · horizon constant', HEADLINE_HORIZON_KM === 250);
+}
+
+/* ------------------------------------------------------------------ *
+ * Section 3 — localization integrity (all 11 languages)
+ * ------------------------------------------------------------------ */
+
+{
+  check('i18n · 11 phrasebooks present', SUPPORTED_PHRASEBOOK_LANGUAGES.length === 11, String(SUPPORTED_PHRASEBOOK_LANGUAGES.length));
+
+  const books = SUPPORTED_PHRASEBOOK_LANGUAGES.map((code) => getPhrasebook(code));
+  check(
+    'i18n · every risk word slot filled',
+    books.every((b) => b.riskWords.every((w) => typeof w === 'string' && w.length > 0)),
+  );
+  check(
+    'i18n · riskWord resolves per level',
+    books.every((b) => riskWord(b, 'SEVERE').length > 0 && riskWord(b, 'LOW').length > 0),
+  );
+  check(
+    'i18n · localizeCondition renders a canonical phrase in every language',
+    books.every((b) => {
+      const s = localizeCondition('Clear sky', b);
+      return s.trim().length > 0 && s !== 'Clear sky';
+    }),
+  );
+  check(
+    'i18n · localizeSource returns text in every language',
+    books.every((b) => localizeSource('GDACS (UN / European Commission) real-time disaster feed', b).trim().length > 0),
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Section 4 — reference dataset integrity
+ * ------------------------------------------------------------------ */
+
+{
+  check('dataset · DATA_CYCLE fully shaped', typeof DATA_CYCLE.cycle === 'string' && DATA_CYCLE.label.includes('IST') && DATA_CYCLE.pfzValidFrom.length > 0, DATA_CYCLE.label);
+  check('dataset · tide stations present', Object.keys(TIDE_STATIONS).length >= 10, String(Object.keys(TIDE_STATIONS).length));
+  check('dataset · geofences present', GEOFENCES.length >= 4, String(GEOFENCES.length));
+}
+
+/* ------------------------------------------------------------------ *
+ * Section 5 — live sea-state honesty
+ *
+ * Open-Meteo returns a well-formed marine block whose every value is `null`
+ * when its model has no grid cell over the point (Digha, on the Bay of Bengal
+ * model edge). Those nulls must never become a confident-looking 0 m / 0 °C
+ * still stamped "real-time sea state" — a fisher acting on that goes to sea
+ * against a sea that was never measured. No live data must be reported at all
+ * in that case, so the caller falls back to the labelled reference snapshot.
+ * ------------------------------------------------------------------ */
+
+{
+  const hours = 96;
+  const series = (value: number | null): number[] => new Array(hours).fill(value);
+
+  // Exactly the shape Digha returns: a full hourly block, every field null.
+  const allNull = {
+    time: new Array(hours).fill('2026-09-29T00:00'),
+    wave_height: series(null),
+    wave_direction: series(null),
+    wave_period: series(null),
+    wind_wave_height: series(null),
+    swell_wave_height: series(null),
+    swell_wave_direction: series(null),
+    sea_surface_temperature: series(null),
+    ocean_current_velocity: series(null),
+    ocean_current_direction: series(null),
+  };
+  const refused = buildOcean('digha', 'Digha', allNull as never, 28.5, '2026-09-29T00:00:00.000Z');
+  check('live · all-null marine payload refuses to build', refused === null, String(refused));
+
+  // A healthy payload still builds, and stays physically plausible.
+  const good = {
+    time: new Array(hours).fill('2026-09-29T00:00'),
+    wave_height: series(1.6),
+    wave_direction: series(165),
+    wave_period: series(9.4),
+    wind_wave_height: series(0.3),
+    swell_wave_height: series(1.2),
+    swell_wave_direction: series(165),
+    sea_surface_temperature: series(28.4),
+    ocean_current_velocity: series(0.6),
+    ocean_current_direction: series(90),
+  };
+  const built = buildOcean('kochi', 'Kochi', good as never, 27.5, '2026-09-29T00:00:00.000Z');
+  check(
+    'live · healthy marine payload builds plausible sea state',
+    built !== null && built.waveHeightMeters > 0 && built.seaSurfaceTempCelsius > 20 && built.forecast.length > 0,
+    built ? `${built.waveHeightMeters} m / ${built.seaSurfaceTempCelsius}°C` : 'null',
+  );
+
+  // A window whose hours are all null must inherit real values from the rest
+  // of the series, not collapse to a flat calm.
+  const holed = {
+    ...good,
+    sea_surface_temperature: new Array(hours).fill(null).map((_, i) => (i < 12 ? null : 28.4)),
+  };
+  const withHole = buildOcean('digha', 'Digha', holed as never, 28.5, '2026-09-29T00:00:00.000Z');
+  check(
+    'live · null hours never average down to a fabricated value',
+    withHole !== null && withHole.seaSurfaceTempCelsius > 20,
+    withHole ? `${withHole.seaSurfaceTempCelsius}°C` : 'null',
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Section 6 — batched point sampling
+ *
+ * The fishing-ground and hotspot layers sample ~30 points through one
+ * comma-separated upstream call, so a mis-mapped response would silently
+ * attach one ground's sea temperature to another. The response echoes back
+ * *snapped* coordinates, which cannot be used to line answers up — only
+ * request order can. This pins that, and pins that a cell the model cannot
+ * answer stays absent rather than becoming a flat 0 m / 0 °C reading.
+ * ------------------------------------------------------------------ */
+
+{
+  const realFetch = globalThis.fetch;
+  const requests: string[] = [];
+  let responses: unknown[] = [];
+
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    requests.push(url.search);
+    const latParam = url.searchParams.get('latitude') ?? '';
+    // Answer positionally, echoing deliberately *snapped* coordinates that do
+    // not match what was asked for — exactly what the real API does.
+    const snapped = latParam.split(',').map((_, i) => `9.${i}${i}`);
+    const rows = responses.map((current, i) => ({
+      latitude: Number(snapped[i]),
+      longitude: 10 + i,
+      current,
+    }));
+    return new Response(JSON.stringify(rows), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  try {
+    // 1. Every point answered, each with a distinct value.
+    responses = [
+      { sea_surface_temperature: 28.1, wave_height: 0.9, ocean_current_velocity: 0.4 },
+      { sea_surface_temperature: 27.4, wave_height: 1.8, ocean_current_velocity: 0.7 },
+      { sea_surface_temperature: 29.2, wave_height: 0.3, ocean_current_velocity: 0.2 },
+    ];
+    requests.length = 0;
+    const got = await fetchPointOceanBatch([
+      { lat: 8.9, lon: 76.3 },
+      { lat: 9.88, lon: 77.24 },
+      { lat: 10.87, lon: 78.19 },
+    ]);
+    const first = got.get('8.900,76.300');
+    const second = got.get('9.880,77.240');
+    const third = got.get('10.870,78.190');
+    check(
+      'live · batched points map onto their own answers',
+      first?.sst === 28.1 && second?.sst === 27.4 && third?.sst === 29.2,
+      `${first?.sst}/${second?.sst}/${third?.sst}`,
+    );
+    check(
+      'live · one call covers the whole batch',
+      requests.length === 1,
+      `${requests.length} call(s) for 3 points`,
+    );
+    check(
+      'live · currents convert to knots',
+      second?.currentKnots !== undefined && Math.abs((second.currentKnots ?? 0) - 1.36) < 0.02,
+      String(second?.currentKnots),
+    );
+
+    // 2. A cell with no model coverage: absent, never zero.
+    responses = [
+      { sea_surface_temperature: 28.1, wave_height: 0.9, ocean_current_velocity: 0.4 },
+      { sea_surface_temperature: null, wave_height: null, ocean_current_velocity: null },
+    ];
+    const gapped = await fetchPointOceanBatch([
+      { lat: 1.5, lon: 2.5 },
+      { lat: 42.5, lon: 87.25 },
+    ]);
+    const gap = gapped.get('42.500,87.250');
+    check(
+      'live · an uncovered cell yields no reading, not a fabricated one',
+      !gap || (gap.sst === undefined && gap.wave === undefined),
+      JSON.stringify(gap),
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Section 7 — back-off scope
+ *
+ * The two reasons a feed goes quiet need different scopes, and getting this
+ * wrong is silent and costly in both directions:
+ *
+ *   * "upstream answered, but had no usable data" is a fact about one *point*
+ *     (Digha has no marine grid cell). Keyed by product alone, one uncovered
+ *     harbour took live sea state away from every other harbour on the coast
+ *     for the whole window — a real production outage, reported only as
+ *     "retrying in ~10 min" with no hint that Digha had caused it.
+ *   * "HTTP 429" is the upstream throttling the whole account/IP, so it must
+ *     park the product *everywhere*. Scoped per point, a throttled IP would be
+ *     re-hit from the next harbour, deepening the throttle.
+ *
+ * Both are asserted here, in that order, so the rate-limit case runs last and
+ * its global window cannot mask the point-scoped one.
+ * ------------------------------------------------------------------ */
+
+{
+  const realFetch = globalThis.fetch;
+  const marineCalls: string[] = [];
+  let throttleDigha = false;
+
+  const hours = 96;
+  const block = (value: number | null): Record<string, unknown> => {
+    const out: Record<string, unknown> = { time: new Array(hours).fill('2026-09-29T00:00') };
+    for (const k of [
+      'wave_height', 'wave_direction', 'wave_period',
+      'wind_wave_height', 'wind_wave_direction', 'wind_wave_period',
+      'swell_wave_height', 'swell_wave_direction', 'swell_wave_period',
+      'sea_surface_temperature', 'ocean_current_velocity', 'ocean_current_direction',
+    ]) {
+      out[k] = new Array(hours).fill(value);
+    }
+    return out;
+  };
+  const forecast = {
+    time: new Array(hours).fill('2026-09-29T00:00'),
+    temperature_2m: new Array(hours).fill(29),
+    precipitation_probability: new Array(hours).fill(10),
+    precipitation: new Array(hours).fill(0),
+    weather_code: new Array(hours).fill(1),
+    wind_speed_10m: new Array(hours).fill(11),
+    wind_direction_10m: new Array(hours).fill(250),
+    wind_gusts_10m: new Array(hours).fill(18),
+    cloud_cover: new Array(hours).fill(30),
+    visibility: new Array(hours).fill(14000),
+  };
+
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    if (url.hostname === 'marine-api.open-meteo.com') {
+      const lat = url.searchParams.get('latitude') ?? '';
+      marineCalls.push(lat);
+      if (throttleDigha) {
+        return new Response('throttled', { status: 429, headers: { 'Retry-After': '1' } });
+      }
+      // Batched multi-point call answers positionally with an array.
+      if (lat.includes(',')) {
+        return new Response(
+          JSON.stringify(
+            lat.split(',').map(() => ({
+              sea_surface_temperature: 28.4,
+              wave_height: 1.1,
+              ocean_current_velocity: 0.5,
+            })),
+          ),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      // Digha sits on the edge of the marine model: HTTP 200, every value null.
+      const payload = { hourly: lat.startsWith('21.9') ? block(null) : block(1.2) };
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url.hostname === 'api.open-meteo.com') {
+      return new Response(JSON.stringify({ hourly: forecast }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    // Everything else (ERA5, GDACS) is irrelevant to these two assertions.
+    return new Response('unavailable', { status: 503 });
+  }) as typeof fetch;
+
+  try {
+    // 1. A point the model cannot answer falls back honestly...
+    await refreshLive('digha');
+    const digha = peekLive('digha');
+    check(
+      'live · a point with no coverage reports not-live rather than inventing sea state',
+      digha?.statuses.ocean === false,
+      String(digha?.statuses.ocean),
+    );
+    const reason = upstreamFailures().ocean?.reason ?? '';
+    check(
+      'live · the no-data reason names the point that caused it',
+      reason.includes('without usable data') && reason.includes('21.928,87.263'),
+      reason,
+    );
+
+    // 2. ...and must not take the live feed away from any other harbour.
+    marineCalls.length = 0;
+    const kochi = await refreshLive('kochi');
+    const kochiSnap = peekLive('kochi');
+    check(
+      'live · one uncovered point does not park the feed for every other harbour',
+      kochiSnap?.statuses.ocean === true,
+      `ocean live=${kochiSnap?.statuses.ocean}, ${marineCalls.length} marine call(s)`,
+    );
+    check(
+      'live · a recovered feed clears the standing failure record',
+      upstreamFailures().ocean === undefined,
+      JSON.stringify(upstreamFailures().ocean),
+    );
+    check(
+      'live · the report is a full refresh, not a cache hit',
+      kochi.anyLive === true,
+      `anyLive=${kochi.anyLive}`,
+    );
+
+    // 3. A 429 is the upstream throttling everyone: it must park every point,
+    //    and every product on that host. Exactly one call is spent learning
+    //    that (the one that gets refused); after it, nothing else may go out.
+    throttleDigha = true;
+    marineCalls.length = 0;
+    await refreshLive('ratnagiri');
+    const discovery = marineCalls.length;
+    marineCalls.length = 0;
+    const after = await refreshLive('goa');
+    check(
+      'live · a 429 parks the host: later harbours make no marine call at all',
+      discovery === 1 && marineCalls.length === 0,
+      `${discovery} call(s) to discover the throttle, then ${marineCalls.length} more`,
+    );
+    check(
+      'live · the throttle is reported against the grid scan too, naming the host',
+      (upstreamFailures()['ocean-points']?.reason ?? '').includes('rate limited by marine-api'),
+      JSON.stringify(upstreamFailures()['ocean-points']),
+    );
+    // The refresh must still answer, and must say so honestly: ocean is
+    // reported not-live (reference), while an unthrottled product stays live.
+    const oceanAfter = after.liveProducts.find((p) => p.product === 'ocean');
+    const weatherAfter = after.liveProducts.find((p) => p.product === 'weather');
+    check(
+      'live · a throttled refresh still answers, with ocean marked not-live',
+      oceanAfter !== undefined && oceanAfter.live === false,
+      JSON.stringify(oceanAfter),
+    );
+    check(
+      'live · a throttle on one product does not fake out the others',
+      weatherAfter !== undefined && weatherAfter.live === true,
+      JSON.stringify(weatherAfter),
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Section 8 — regression: driver identity survives localization
+ *
+ * This one shipped broken. `buildRecommendations` gated its two most useful
+ * sentences on `top.label === 'chlorophyll-a'`, and when the correlation labels
+ * were translated that comparison stopped matching — so every answer in ten of
+ * eleven languages silently lost the chlorophyll and SST recommendations. It
+ * type-checked cleanly, because `label` is still just a `string`, and it passed
+ * the "no English residue" checks, because a deleted sentence contains no
+ * English. Only asserting that the sentence is *present* catches it.
+ * ------------------------------------------------------------------ */
+
+{
+  const book = getPhrasebook('en-IN');
+  const series = getHistoricalSeries('Bay of Bengal', 36);
+  const analysis = diagnose(series, book);
+
+  // Sanity: the fixture must actually have a chlorophyll- or SST-led top
+  // correlation, otherwise "recommendation survived" proves nothing.
+  const topDriver = analysis.correlations[0]?.driverId;
+  check(
+    'regression · fixture has a driver-specific top correlation',
+    topDriver === 'chlorophyll' || topDriver === 'sst',
+    `topDriver=${topDriver}`,
+  );
+
+  const enRecs = buildRecommendations(analysis, 'Bay of Bengal', book);
+  const chlExpected = book.ui.recommendChlWord.split('{region}')[0];
+  check(
+    'regression · chlorophyll recommendation present in English',
+    topDriver === 'chlorophyll' ? enRecs.some((r) => r.startsWith(chlExpected)) : enRecs.includes(book.ui.recommendSstWord),
+    JSON.stringify(enRecs),
+  );
+
+  // The real test: the same analysis, through every other phrasebook.
+  const survivors: string[] = [];
+  const untranslated: string[] = [];
+  const unfilled: string[] = [];
+
+  for (const code of SUPPORTED_PHRASEBOOK_LANGUAGES) {
+    if (code === 'en-IN') continue;
+    const b = getPhrasebook(code);
+    const recs = buildRecommendations(analysis, 'Bay of Bengal', b);
+
+    // Present? This is what broke.
+    const present =
+      topDriver === 'chlorophyll'
+        ? recs.some((r) => r.startsWith(b.ui.recommendChlWord.split('{region}')[0]))
+        : recs.includes(b.ui.recommendSstWord);
+    if (!present) survivors.push(code);
+
+    // Translated? Absence of English is necessary but not sufficient, so the
+    // sibling assertion in Section 3 catches a wholesale English sentence.
+    const sentinel = getPhrasebook('en-IN').ui.recommendAssessWord;
+    if (recs.some((r) => r === sentinel)) untranslated.push(code);
+
+    for (const rec of recs) {
+      if (/\{[a-zA-Z]+\}/.test(rec)) unfilled.push(`${code}: ${rec}`);
+    }
+  }
+
+  check(
+    'regression · driver-specific recommendation survives all 10 translations',
+    survivors.length === 0,
+    `missing in: ${survivors.join(', ')}`,
+  );
+  check(
+    'regression · no recommendation fell back to English text',
+    untranslated.length === 0,
+    `english in: ${untranslated.join(', ')}`,
+  );
+  check(
+    'regression · every {placeholder} is filled in every language',
+    unfilled.length === 0,
+    unfilled.slice(0, 3).join(' | '),
+  );
+
+  // Identity must not be re-derivable from the label: assert the labels really
+  // do differ per language, so the guard above is actually being exercised.
+  const enLabel = analysis.correlations[0]?.label;
+  const hiLabel = diagnose(series, getPhrasebook('hi-IN')).correlations[0]?.label;
+  check(
+    'regression · labels are genuinely localized (guard is load-bearing)',
+    !!enLabel && !!hiLabel && enLabel !== hiLabel,
+    `en=${enLabel} hi=${hiLabel}`,
+  );
+
+  // The numeric diagnosis must be language-independent, or the correlation
+  // ordering would shift with the UI language.
+  const cpueHi = diagnose(series, getPhrasebook('hi-IN')).cpue;
+  check(
+    'regression · diagnosis is language-independent',
+    analysis.cpue === cpueHi,
+    `${analysis.cpue} vs ${cpueHi}`,
+  );
+
+  // Direct guard on the identity field itself.
+  check(
+    'regression · every correlation carries a driverId',
+    analysis.correlations.every((c) =>
+      ['chlorophyll', 'sst', 'effort', 'rainfall'].includes(c.driverId),
+    ),
+    JSON.stringify(analysis.correlations.map((c) => c.driverId)),
+  );
+
+  // Sweep the source for the anti-pattern itself, so it cannot come back.
+  const histSrc = readFileSync(
+    new URL('../src/agents/historicalAgent.ts', import.meta.url),
+    'utf8',
+  );
+  check(
+    'regression · no label comparison against an English literal remains',
+    !/\.label\s*===\s*'[a-z ]+'/i.test(histSrc),
+    (histSrc.match(/\.label\s*===\s*'[a-z ]+'/gi) ?? []).join(', '),
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Section 9 — regression: no English can reach the UI through a fallback
+ *
+ * The second localisation bug class. A component that takes an optional
+ * `book` prop and writes `book ? book.ui.x : 'English'` type-checks perfectly,
+ * passes the answer-level residue check (the engine was never involved), and
+ * renders English in all eleven languages the moment one call site forgets to
+ * pass the prop. It happened for real in `ResearcherDashboard.tsx`.
+ *
+ * The cure is structural rather than vigilance: `book` is a *required* prop on
+ * every component that renders phrasebook text, so a forgotten prop is a
+ * compile error. These tests assert both halves of that contract — the ternary
+ * shape is gone, and the props really are required — so the cure cannot be
+ * quietly reverted by an "optional prop is friendlier" refactor.
+ * ------------------------------------------------------------------ */
+
+{
+  const COMPONENT_DIR = fileURLToPath(new URL('../src/components/', import.meta.url));
+  const files: string[] = [];
+  const collect = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name);
+      if (statSync(p).isDirectory()) collect(p);
+      else if (p.endsWith('.tsx')) files.push(p);
+    }
+  };
+  collect(COMPONENT_DIR);
+
+  // Every component that reaches for `book.ui` / `book.labels` must obtain a
+  // phrasebook by one of exactly two routes, neither of which can be undefined:
+  //
+  //   1. a required `book: Phrasebook` prop — no `?`, no default value; or
+  //   2. `const book = getPhrasebook(...)` derived from the language it is given.
+  //
+  // Anything else (an optional prop, a prop defaulted to `undefined`) is the bug.
+  const unbooked: string[] = [];
+  const englishTernary: string[] = [];
+
+  for (const file of files) {
+    const source = readFileSync(file, 'utf8');
+    const name = relative(COMPONENT_DIR, file);
+
+    if (/\bbook\.(ui|labels)\b/.test(source)) {
+      const requiredProp =
+        /\bbook\s*:\s*Phrasebook/.test(source) && !/\bbook\?\s*:/.test(source);
+      const derived = /(?:const|let)\s+book\s*=\s*(?:useMemo\(\s*\(\)\s*=>\s*)?getPhrasebook\(/.test(
+        source,
+      );
+      if (!requiredProp && !derived) unbooked.push(name);
+    }
+
+    // `book ? book.ui.x : 'English'` — an English string on the losing branch of
+    // a phrasebook ternary. This is the exact shape that broke ResearcherDashboard.
+    for (const m of source.matchAll(
+      /book\s*\?\s*book\.(?:ui|labels)[\w.]+\s*:\s*'([^']{2,})'/g,
+    )) {
+      englishTernary.push(`${name}: ${m[1]}`);
+    }
+  }
+
+  check(
+    'regression · every phrasebook consumer gets its book from a required prop or getPhrasebook()',
+    unbooked.length === 0,
+    unbooked.join(', '),
+  );
+  check(
+    'regression · no `book ? book.ui.x : "English"` fallback remains in any component',
+    englishTernary.length === 0,
+    englishTernary.join(' | '),
+  );
+}
+
+
+
+/* ------------------------------------------------------------------ *
+ * Section 11 — the freshness readout cannot lie
+ *
+ * The second prototype defect was "stale data, no real-time sync, and the real
+ * date-time is not reflected". The cure is a clock and an age readout, and a
+ * cure like that is only worth anything if it cannot overstate its own
+ * freshness. Three ways it can lie, all asserted here:
+ *
+ *   1. rounding the age down, so twenty-eight minutes reads as "just now";
+ *   2. clock skew making the age negative, rendering a future timestamp;
+ *   3. the clock silently switching to the *device's* timezone, so the header
+ *      disagrees with the IST bulletin printed directly beneath it.
+ *
+ * The last one is a real hazard on this product specifically: a fisher in
+ * Chennai reads a screen that says 08:40 and a bulletin that says 08:10, with
+ * no way to tell whether ORCA is wrong or the device is set to a flight mode's
+ * leftover timezone.
+ * ------------------------------------------------------------------ */
+
+{
+  const { istClock, secondsSince } = await import('../src/hooks/useNow');
+  const now = new Date();
+
+  // --- 1. the age is never understated -------------------------------------
+  // A payload stamped in the future — device clock set ahead, or a server whose
+  // clock leads the phone's — must read as "just now" and not as a negative age.
+  const clockSkewed = secondsSince(now.getTime() + 60_000, now);
+  check('freshness · a future timestamp clamps to zero, never negative', clockSkewed === 0, `got ${clockSkewed}`);
+
+  const thirtySeconds = secondsSince(now.getTime() - 30_000, now);
+  check(
+    'freshness · a 30-second-old reading is 30 seconds old, not 0',
+    thirtySeconds === 30,
+    `got ${thirtySeconds}`,
+  );
+
+  // --- 2. the clock is IST, whatever the device thinks --------------------
+  // 06:30 UTC is 12:00 IST, a six-and-a-half hour offset that no amount of
+  // device-locale drift can fake.
+  const utcMidMorning = new Date('2026-09-30T06:30:00Z');
+  const clocked = istClock(utcMidMorning);
+  check(
+    'freshness · the clock reports IST, not the device timezone',
+    clocked.startsWith('12:00'),
+    `2026-09-30T06:30Z should read 12:00 IST, got ${clocked}`,
+  );
+
+  check(
+    'freshness · the clock is HH:MM:SS and 24-hour',
+    /^\d{2}:\d{2}:\d{2}$/.test(clocked),
+    `got ${clocked}`,
+  );
+
+  // Independent of the formatter: the offset really is +05:30, so the age the
+  // user reads and the stamp on the bulletin share a time base.
+  const offsetMinutes = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    timeZoneName: 'longOffset',
+  })
+    .formatToParts(utcMidMorning)
+    .find((p) => p.type === 'timeZoneName')?.value;
+  check(
+    'freshness · the clock time base is UTC+05:30',
+    offsetMinutes === 'GMT+05:30',
+    `got ${offsetMinutes}`,
+  );
+
+  // --- 3. the poll period is not shorter than the engine's cache TTL -------
+  // Polling faster than the engine's own 12-minute snapshot cannot return
+  // anything new, so it only spends request budget and pushes the live sources
+  // further into their back-off. Assert the client's constant matches the
+  // engine's, so the two cannot drift apart.
+  const appSrc = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const clientTtl = /const AUTO_REFRESH_MS = (\d+) \* 60 \* 1000;/.exec(appSrc);
+  const liveSrc = readFileSync(new URL('../src/core/live.ts', import.meta.url), 'utf8');
+  const serverTtl = /const TTL_MS = (\d+) \* 60 \* 1000;/.exec(liveSrc);
+
+  check(
+    'freshness · the client declares a poll period in whole minutes',
+    !!clientTtl,
+    'AUTO_REFRESH_MS not found in src/App.tsx',
+  );
+  check(
+    'freshness · the engine still declares a cache TTL in whole minutes',
+    !!serverTtl,
+    'TTL_MS not found in src/core/live.ts',
+  );
+  check(
+    'freshness · the poll period matches the engine cache TTL',
+    !!clientTtl && !!serverTtl && clientTtl[1] === serverTtl[1],
+    `client ${clientTtl?.[1]}min vs engine ${serverTtl?.[1]}min`,
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Summary
+ * ------------------------------------------------------------------ */
+
+console.log(`\nUnit tests: ${passed} passed, ${failed} failed`);
+if (failed > 0) {
+  for (const f of failures) console.error(`  ✗ ${f}`);
+  process.exit(1);
+}
+console.log('All unit tests green.');

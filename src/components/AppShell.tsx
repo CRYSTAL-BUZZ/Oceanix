@@ -1,0 +1,391 @@
+import React from 'react';
+import {
+  Anchor,
+  Bot,
+  Compass,
+  Fish,
+  FlaskConical,
+  Globe,
+  Landmark,
+  LayoutDashboard,
+  Map,
+  MessageSquare,
+  Printer,
+  Radar,
+  RefreshCw,
+  Satellite,
+  Siren,
+  Waves,
+  Wifi,
+  WifiOff,
+} from 'lucide-react';
+import { PERSONAS, PersonaId } from '../personas';
+import type { HarborLocation, LanguageOption } from '../types';
+import type { EngineStatus } from '../services/orcaApi';
+import { HARBORS } from '../core/dataset';
+import { UiStrings, getPhrasebook, fillTemplate } from '../core/i18n';
+import { localizeProductSource } from '../core/localize';
+import { FreshnessStrip } from './FreshnessStrip';
+
+export type ViewId = 'dashboard' | 'map' | 'chat' | 'fleet' | 'report';
+
+interface AppShellProps {
+  persona: PersonaId;
+  onPersonaChange: (persona: PersonaId) => void;
+  view: ViewId;
+  onViewChange: (view: ViewId) => void;
+  harbor: HarborLocation;
+  onSelectHarbor: (harbor: HarborLocation) => void;
+  language: LanguageOption;
+  onOpenLanguage: () => void;
+  status: EngineStatus | null;
+  onRefreshBrief: () => void;
+  briefLoading: boolean;
+  gpsFix: { latitude: number; longitude: number } | null;
+  gpsState: 'idle' | 'locating' | 'ok' | 'denied';
+  onToggleGps: () => void;
+  /**
+   * When the displayed situation report reached the client, or null before the
+   * first response lands. Drives the freshness strip; without it the screen can
+   * look live while serving an arbitrarily old snapshot.
+   */
+  briefReceivedAt: number | null;
+  /** Which harbour the engine actually anchored the report to, and why. */
+  briefAnchor: { harborName: string; distanceKm: number | null } | null;
+  children: React.ReactNode;
+}
+
+const PERSONA_ICON: Record<PersonaId, React.ComponentType<{ className?: string }>> = {
+  fisher: Fish,
+  researcher: FlaskConical,
+  coastal: Landmark,
+  disaster: Siren,
+  maritime: Anchor,
+};
+
+const PERSONA_ACTIVE_STYLE: Record<PersonaId, string> = {
+  fisher: 'persona-active-cyan',
+  researcher: 'persona-active-violet',
+  coastal: 'persona-active-amber',
+  disaster: 'persona-active-rose',
+  maritime: 'persona-active-sky',
+};
+
+const VIEW_TABS: { id: ViewId; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
+  { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { id: 'map', label: 'GIS Map', icon: Map },
+  { id: 'chat', label: 'Decision Chat', icon: MessageSquare },
+  { id: 'fleet', label: 'Fleet Watch', icon: Waves },
+  { id: 'report', label: 'Print report', icon: Printer },
+];
+
+/** Translates a persona chip's label, tagline and description for the active language. */
+function personaUi(ui: UiStrings) {
+  return {
+    fisher: { label: ui.personaFisher, tag: ui.tagFisher, desc: ui.descFisher },
+    researcher: { label: ui.personaResearcher, tag: ui.tagResearcher, desc: ui.descResearcher },
+    coastal: { label: ui.personaCoastal, tag: ui.tagCoastal, desc: ui.descCoastal },
+    disaster: { label: ui.personaDisaster, tag: ui.tagDisaster, desc: ui.descDisaster },
+    maritime: { label: ui.personaMaritime, tag: ui.tagMaritime, desc: ui.descMaritime },
+  } as const;
+}
+
+const NAV_UI_KEYS: Record<Exclude<ViewId, 'report'>, keyof UiStrings> = {
+  dashboard: 'navDashboard',
+  map: 'navMap',
+  chat: 'navChat',
+  fleet: 'navFleet',
+};
+
+export const AppShell: React.FC<AppShellProps> = ({
+  persona,
+  onPersonaChange,
+  view,
+  onViewChange,
+  harbor,
+  onSelectHarbor,
+  language,
+  onOpenLanguage,
+  status,
+  onRefreshBrief,
+  briefLoading,
+  gpsFix,
+  gpsState,
+  onToggleGps,
+  briefReceivedAt,
+  briefAnchor,
+  children,
+}) => {
+  const offline = status?.offline ?? false;
+  const version = offline ? `in-browser v${status?.version ?? ''}` : `v${status?.version ?? '—'}`;
+  const ui = getPhrasebook(language.code).ui;
+  const book = getPhrasebook(language.code);
+  const personaNames = personaUi(ui);
+  const tabs = VIEW_TABS.map((tab) => ({
+    ...tab,
+    label: tab.id === 'report' ? 'Print report' : ui[NAV_UI_KEYS[tab.id]],
+  }));
+
+  return (
+    <div className="app-shell h-screen overflow-hidden flex flex-col text-slate-100">
+      {/* ============ Top bar ============ */}
+      <header className="app-chrome sticky top-0 z-40 border-b border-slate-800/80 bg-slate-950/80 backdrop-blur">
+        <div className="app-header-top px-4 lg:px-6 pt-3 pb-2 flex flex-wrap items-center gap-x-4 gap-y-2">
+          {/* Brand */}
+          <div className="app-brand flex items-center gap-2.5 min-w-0">
+            <span className="relative w-9 h-9 rounded-xl border border-cyan-500/40 bg-cyan-500/10 flex items-center justify-center shrink-0">
+              <Radar className="w-5 h-5 text-cyan-400" />
+              <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-emerald-400 sonar-ping" />
+            </span>
+            <div className="leading-tight min-w-0">
+              <div className="flex items-center gap-2">
+                <h1 className="font-extrabold tracking-[0.22em] text-slate-50 text-sm">OCEANIX</h1>
+                <span className="hidden sm:inline text-[9px] font-bold text-cyan-300 border border-cyan-500/40 rounded px-1.5 py-0.5 tracking-wider">
+                  MARINE OPS
+                </span>
+              </div>
+              <p className="text-[9px] text-slate-400 tracking-[0.14em] uppercase">
+                {ui.platformTagline}
+              </p>
+            </div>
+          </div>
+
+          {/* Engine status */}
+          <div className="header-meta ml-auto">
+            <div className="header-status-group">
+              <span
+                className={`engine-status hidden md:inline-flex items-center gap-1.5 text-[10px] font-bold ${
+                  offline ? 'text-amber-300' : 'text-emerald-300'
+                }`}
+              >
+                {offline ? <WifiOff className="w-3.5 h-3.5" /> : <Wifi className="w-3.5 h-3.5" />}
+                {offline ? ui.offlineEngine : ui.live}
+                <span className="text-slate-500 font-medium">· {version}</span>
+              </span>
+
+              <div className="header-freshness hidden lg:block">
+                <FreshnessStrip book={book} receivedAt={briefReceivedAt} loading={briefLoading} />
+              </div>
+
+              {gpsState === 'ok' && briefAnchor?.distanceKm !== null && briefAnchor && (
+                <span
+                  className="header-anchor hidden xl:inline"
+                  title={fillTemplate(ui.anchorGpsWord, {
+                    harbor: briefAnchor.harborName,
+                    km: briefAnchor.distanceKm,
+                  })}
+                >
+                  {fillTemplate(ui.anchorGpsWord, {
+                    harbor: briefAnchor.harborName,
+                    km: briefAnchor.distanceKm,
+                  })}
+                </span>
+              )}
+            </div>
+
+            <div className="app-header-actions">
+              <button
+                onClick={onRefreshBrief}
+                disabled={briefLoading}
+                className="p-2 rounded-lg border border-slate-700 bg-slate-900/70 hover:bg-slate-800 text-slate-300 transition-colors disabled:opacity-50"
+                title={ui.refresh}
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${briefLoading ? 'animate-spin' : ''}`} />
+              </button>
+              <button
+                onClick={onToggleGps}
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+                  gpsState === 'ok'
+                    ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300'
+                    : gpsState === 'locating'
+                      ? 'border-amber-500/50 bg-amber-500/10 text-amber-300'
+                      : 'border-slate-700 bg-slate-900/70 text-slate-300 hover:bg-slate-800'
+                }`}
+                title={ui.useGps}
+              >
+                {gpsState === 'locating' ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Compass className="w-3.5 h-3.5" />
+                )}
+                <span className="hidden md:inline">
+                  {gpsFix
+                    ? `GPS ${gpsFix.latitude.toFixed(2)}°, ${gpsFix.longitude.toFixed(2)}°`
+                    : gpsState === 'denied'
+                      ? ui.gpsDenied
+                      : ui.useGps}
+                </span>
+              </button>
+              <button
+                onClick={onOpenLanguage}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-700 bg-slate-900/70 hover:bg-slate-800 text-slate-200 text-xs font-medium transition-colors"
+                title={ui.changeLanguage}
+              >
+                <Globe className="w-3.5 h-3.5 text-cyan-400" />
+                <span>{language.nativeLabel}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Controls row: harbour, role selector and page tabs */}
+        <div className="harbor-nav-row px-4 lg:px-6 pb-2.5 flex flex-wrap items-center gap-x-4 gap-y-2">
+          <label className="flex items-center gap-1.5 text-[11px] text-slate-400">
+            <Compass className="w-3.5 h-3.5 text-slate-500" />
+            <select
+              value={harbor.id}
+              onChange={(event) => {
+                const next = HARBORS.find((h) => h.id === event.target.value);
+                if (next) onSelectHarbor(next);
+              }}
+              className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-200 font-medium focus:outline-none focus:border-cyan-500/60"
+            >
+              {HARBORS.map((h) => (
+                <option key={h.id} value={h.id}>
+                  {h.shortName} · {h.state}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {view !== 'chat' && (
+            <div className="persona-switcher flex min-w-0 max-w-full items-center gap-1.5 overflow-x-auto scroll-thin">
+              {PERSONAS.map((p) => {
+                const active = p.id === persona;
+                const Icon = PERSONA_ICON[p.id];
+                const localized = personaNames[p.id];
+                return (
+                  <button
+                    key={p.id}
+                    onClick={() => onPersonaChange(p.id)}
+                    className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-[11px] font-semibold transition-colors ${
+                      active
+                        ? PERSONA_ACTIVE_STYLE[p.id]
+                        : 'border-slate-800 bg-slate-900/40 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                    }`}
+                    title={localized.desc}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    <span>{localized.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          <nav className="app-page-nav flex items-center gap-1 ml-auto xl:hidden">
+            {tabs.map((tab) => {
+              const active = view === tab.id;
+              const Icon = tab.icon;
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => onViewChange(tab.id)}
+                  className={`view-tab flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-colors ${
+                    active
+                      ? 'is-active'
+                      : 'text-slate-300 hover:bg-slate-800/70'
+                  }`}
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">{tab.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+      </header>
+
+      {/* Data cycle strip */}
+      {view !== 'chat' && (
+      <div className="data-cycle-strip app-chrome px-4 lg:px-6 py-2 flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-slate-800/60 bg-slate-900/30">
+        <span className="flex items-center gap-1.5 text-[9px] font-bold tracking-[0.14em] text-slate-500 uppercase">
+          <Satellite className="w-3 h-3 text-cyan-500" />
+          {ui.dataCycle}
+        </span>
+        {status?.dataCycle ? (
+          <>
+            <span className="text-[10px] text-slate-300 font-medium">{status.dataCycle.label}</span>
+            <span className="text-[10px] text-slate-500 hud-num">#{status.dataCycle.cycle}</span>
+            <span className="hidden lg:flex items-center gap-1.5 flex-wrap">
+              {status.dataCycle.sources.slice(0, 4).map((source) => (
+                <span
+                  key={source}
+                  className="px-1.5 py-0.5 rounded bg-slate-800/70 text-[9px] text-slate-400 border border-slate-700/60"
+                >
+                  {localizeProductSource(source, book)}
+                </span>
+              ))}
+            </span>
+          </>
+        ) : (
+          <span className="text-[10px] text-slate-500">
+            {offline ? ui.browserDataset : ui.loading}
+          </span>
+        )}
+        <span className="ml-auto flex items-center gap-1.5 text-[9px] text-slate-500">
+          <Bot className="w-3 h-3" />
+          {status?.counts.agents ?? '—'} {ui.agentsWord} · {status?.counts.languages ?? '—'}{' '}
+          {ui.languagesWord} · {status?.counts.harbours ?? '—'} {ui.harboursWord}
+        </span>
+      </div>
+      )}
+
+      <div className="app-workspace flex-1 min-h-0 flex">
+        <aside className="workspace-sidebar hidden xl:flex" aria-label="Main navigation">
+          <div className="workspace-sidebar-heading">
+            <span className="workspace-sidebar-kicker">ORCA / OPERATIONS</span>
+            <span className="workspace-sidebar-title">{harbor.shortName}</span>
+            <span className="workspace-sidebar-subtitle">{harbor.state} · {harbor.basin}</span>
+          </div>
+          <nav className="workspace-sidebar-nav">
+            {tabs.map((tab) => {
+              const active = view === tab.id;
+              const Icon = tab.icon;
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => onViewChange(tab.id)}
+                  aria-current={active ? 'page' : undefined}
+                  className={`workspace-nav-item ${active ? 'is-active' : ''}`}
+                >
+                  <Icon className="w-4 h-4" />
+                  <span>{tab.label}</span>
+                  {active && <span className="workspace-nav-indicator" />}
+                </button>
+              );
+            })}
+          </nav>
+          <div className="workspace-sidebar-footer">
+            <span className={`workspace-status-dot ${offline ? 'is-offline' : ''}`} />
+            <span>{offline ? ui.offlineEngine : ui.live}</span>
+            <span className="ml-auto hud-num">v{status?.version ?? '—'}</span>
+          </div>
+        </aside>
+
+        <main className={`app-main flex-1 min-w-0 min-h-0 flex flex-col ${view === 'report' ? 'print-report-main' : ''}`}>
+          <div
+            className={`flex-1 min-h-0 ${
+              view === 'chat' || view === 'report'
+                ? 'flex flex-col overflow-hidden'
+                : 'p-4 lg:p-6 overflow-y-auto'
+            } ${view === 'report' ? 'print-report-content' : ''}`}
+          >
+            {children}
+          </div>
+        </main>
+      </div>
+
+      {/* Footer */}
+      <footer className={`app-chrome border-t border-slate-800/60 px-4 lg:px-6 py-2.5 text-[9px] text-slate-600 flex flex-wrap items-center gap-x-4 gap-y-1 ${view === 'chat' ? 'hidden' : ''}`}>
+        <span>OCEANIX Marine Intelligence Platform · ORCA decision engine</span>
+        {/* On a phone the top bar has no room for the age of the data, so it is
+            repeated here rather than dropped: the readout is not decoration. */}
+        <span className="lg:hidden inline-flex">
+          <FreshnessStrip book={book} receivedAt={briefReceivedAt} loading={briefLoading} />
+        </span>
+        <span className="hidden sm:inline">{ui.footerDisclaimer}</span>
+      </footer>
+    </div>
+  );
+};
